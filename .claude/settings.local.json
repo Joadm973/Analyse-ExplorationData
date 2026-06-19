@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk ls *)",
+      "Bash(rtk git *)",
+      "Bash(git -C \"/c/Ynov_projects/B3/Analyse&exploration de données\" remote -v)",
+      "Bash(git -C \"/c/Ynov_projects/B3/Analyse&exploration de données\" status)",
+      "Bash(rtk read *)",
+      "Bash(GIT_DIR=\"/c/Ynov_projects/B3/Analyse&exploration de données/.git\" GIT_WORK_TREE=\"/c/Ynov_projects/B3/Analyse&exploration de données\" rtk git *)",
+      "Bash(git --git-dir='/c/Ynov_projects/B3/Analyse&exploration de données/.git' --work-tree='/c/Ynov_projects/B3/Analyse&exploration de données' status)",
+      "PowerShell($path = 'C:\\\\Ynov_projects\\\\B3\\\\Analyse&exploration de données'; git -C $path init 2>&1)",
+      "PowerShell(Remove-Item *)"
+    ]
+  }
+}
