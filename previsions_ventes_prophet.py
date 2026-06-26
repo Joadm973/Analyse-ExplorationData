@@ -4,8 +4,7 @@
 # =============================================================================
 
 import pandas as pd
-import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from prophet import Prophet
 import logging
 import warnings
@@ -13,17 +12,18 @@ import warnings
 warnings.filterwarnings('ignore')
 logging.getLogger('cmdstanpy').setLevel(logging.WARNING)
 
-# --- Paramètres configurables ---
 HOST           = "127.0.0.1"
 PORT           = 3306
 USER           = "root"
 PASSWORD       = "azerty"
 DATABASE       = "data"
-HORIZON        = 6
+TABLE_SORTIE   = "previsions_ventes_prophet"
+DATE_MAX_HIST  = "2018-12-31"
+DATE_MIN_HIST  = "2015-01-01"
+HORIZON_START  = "2019-01-01"
+HORIZON_END    = "2019-12-01"
 MIN_HISTORIQUE = 24
 TOP_N          = 5
-METRIC         = "Quantite"
-TABLE_SORTIE   = "previsions_ventes_prophet"
 
 # =============================================================================
 # 1. CONNEXION ET CHARGEMENT
@@ -34,73 +34,69 @@ engine = create_engine(
     echo=False
 )
 
-query = f"""
+query = """
     SELECT
         Cle_Produit,
-        DATE_FORMAT(Date_Facturation, '%%Y-%%m-01') AS periode,
-        SUM({METRIC}) AS valeur
+        Date_Facturation,
+        Montant_HT
     FROM ventes
     WHERE Date_Facturation IS NOT NULL
-    GROUP BY Cle_Produit, periode
+      AND Date_Facturation <= '2018-12-31'
 """
 
-print("Chargement des ventes depuis MySQL...")
+print("Chargement des ventes (filtre <= 2018-12-31)...")
 df = pd.read_sql(query, engine)
-df['periode'] = pd.to_datetime(df['periode'])
+df['Date_Facturation'] = pd.to_datetime(df['Date_Facturation'])
+df['Montant_HT'] = pd.to_numeric(df['Montant_HT'], errors='coerce').fillna(0)
 print(f"  {len(df):,} lignes chargées ({df['Cle_Produit'].nunique():,} produits distincts)")
 
 # =============================================================================
-# 2. IDENTIFICATION DU TOP 5
+# 2. IDENTIFICATION DU TOP 5 (sur période 2015-2018)
 # =============================================================================
+df_hist = df[
+    (df['Date_Facturation'] >= DATE_MIN_HIST) &
+    (df['Date_Facturation'] <= DATE_MAX_HIST)
+].copy()
+
 top5 = (
-    df.groupby('Cle_Produit')['valeur']
+    df_hist.groupby('Cle_Produit')['Montant_HT']
     .sum()
     .nlargest(TOP_N)
     .index.tolist()
 )
 
-print(f"\nTop {TOP_N} produits les plus vendus (par {METRIC}) :")
+print(f"\nTop {TOP_N} produits (Montant_HT 2015-2018) :")
 for i, code in enumerate(top5, 1):
-    total = df[df['Cle_Produit'] == code]['valeur'].sum()
-    print(f"  {i}. {code}  —  total {METRIC} : {total:,.0f}")
+    total = df_hist[df_hist['Cle_Produit'] == code]['Montant_HT'].sum()
+    print(f"  {i}. {code}  —  total : {total:,.2f}")
 
 # =============================================================================
-# 3. CONSTRUCTION DES SÉRIES AVEC ZÉROS POUR MOIS MANQUANTS
+# 3. PRÉVISIONS PROPHET PAR PRODUIT
 # =============================================================================
-date_min = df['periode'].min()
-date_max = df['periode'].max()
-all_months = pd.date_range(start=date_min, end=date_max, freq='MS')
+all_months = pd.date_range(start=DATE_MIN_HIST, end=DATE_MAX_HIST, freq='MS')
+forecast_months = pd.date_range(start=HORIZON_START, end=HORIZON_END, freq='MS')
 
-print(f"\nPlage temporelle : {date_min.strftime('%Y-%m')} à {date_max.strftime('%Y-%m')} "
-      f"({len(all_months)} mois)")
-
-# =============================================================================
-# 4. PRÉVISIONS PROPHET PRODUIT PAR PRODUIT
-# =============================================================================
-results = []
+results: list[pd.DataFrame] = []
 
 for i, code in enumerate(top5, 1):
     print(f"\n[{i}/{TOP_N}] Produit {code}")
 
-    serie = (
-        df[df['Cle_Produit'] == code]
-        .set_index('periode')['valeur']
-        .reindex(all_months, fill_value=0)
+    monthly = (
+        df_hist[df_hist['Cle_Produit'] == code]
+        .groupby(pd.Grouper(key='Date_Facturation', freq='MS'))['Montant_HT']
+        .sum()
     )
 
-    nb_points = len(serie)
-    print(f"  Points disponibles : {nb_points} mois")
+    serie = monthly.reindex(all_months, fill_value=0)
+    nb_points = (serie > 0).sum()
+    print(f"  Mois avec ventes : {nb_points} / {len(serie)}")
 
-    if nb_points < MIN_HISTORIQUE:
+    if len(serie) < MIN_HISTORIQUE:
         print(f"  !! Ignoré (seuil minimum : {MIN_HISTORIQUE} mois)")
         continue
 
-    prophet_df = pd.DataFrame({
-        'ds': serie.index,
-        'y':  serie.values.astype(float)
-    })
+    prophet_df = pd.DataFrame({'ds': serie.index, 'y': serie.values.astype(float)})
 
-    # Silence Prophet/cmdstanpy
     logging.disable(logging.INFO)
     try:
         model = Prophet(
@@ -113,42 +109,33 @@ for i, code in enumerate(top5, 1):
     finally:
         logging.disable(logging.NOTSET)
 
-    future = model.make_future_dataframe(periods=HORIZON, freq='MS')
+    future = pd.DataFrame({'ds': pd.date_range(start=DATE_MIN_HIST, end=HORIZON_END, freq='MS')})
     forecast = model.predict(future)
 
-    forecast_future = (
-        forecast[forecast['ds'] > date_max][['ds', 'yhat']]
+    forecast_out = (
+        forecast[forecast['ds'].isin(forecast_months)][['ds', 'yhat']]
         .copy()
         .rename(columns={'ds': 'date', 'yhat': 'valeur_prevue'})
     )
+    forecast_out['valeur_prevue'] = forecast_out['valeur_prevue'].clip(lower=0).round(2)
+    forecast_out['Code_Produit'] = code
 
-    forecast_future['valeur_prevue'] = forecast_future['valeur_prevue'].clip(lower=0).round(2)
-    forecast_future['Cle_Produit']  = code
-
-    results.append(forecast_future)
-    print(f"  {len(forecast_future)} prévisions générées")
-    print(forecast_future[['date', 'valeur_prevue']].to_string(index=False))
+    results.append(forecast_out)
+    print(f"  {len(forecast_out)} prévisions générées (2019-01 à 2019-12)")
 
 # =============================================================================
-# 5. CONSOLIDATION ET ÉCRITURE EN BASE
+# 4. CONSOLIDATION ET ÉCRITURE EN BASE
 # =============================================================================
 if not results:
     print("\nAucun produit éligible. Aucune donnée écrite.")
 else:
-    df_out = pd.concat(results, ignore_index=True)
-    df_out = df_out[['Cle_Produit', 'date', 'valeur_prevue']]
-
-    print(f"\n--- Résumé ---")
-    print(f"Produits traités   : {df_out['Cle_Produit'].nunique()}")
-    print(f"Lignes générées    : {len(df_out)}")
-    print(f"Prévisions néga.   : {(df_out['valeur_prevue'] < 0).sum()}")
-
-    with engine.connect() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {TABLE_SORTIE}"))
-        conn.commit()
+    df_out = pd.concat(results, ignore_index=True)[['Code_Produit', 'date', 'valeur_prevue']]
 
     df_out.to_sql(TABLE_SORTIE, engine, if_exists='replace', index=False)
-    print(f"\nTable '{TABLE_SORTIE}' écrite avec succès dans la base '{DATABASE}'.")
 
-    print("\nAperçu des données :")
-    print(df_out.to_string(index=False))
+    print(f"\n--- Résumé ---")
+    print(f"Produits retenus   : {df_out['Code_Produit'].unique().tolist()}")
+    print(f"Lignes générées    : {len(df_out)}  (attendu : 60)")
+    print(f"\nAperçu (premières lignes) :")
+    print(df_out.head(15).to_string(index=False))
+    print(f"\nTable '{TABLE_SORTIE}' écrite dans la base '{DATABASE}'.")
